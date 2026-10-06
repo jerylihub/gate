@@ -7,15 +7,15 @@ VPN Gate SSTP 节点检测流水线
   2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
      (OpenVPN 配置里 proto tcp + remote <ip> <port>; UDP-only 中继无法走 SSTP/xray 链, 直接丢弃)
   3. 按 host+port+protocol 去重
-  4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?proxyip=host:port
+  4. 并发调用已部署的 Cloudflare Worker: GET {WORKER}/check?proxyip=host:port
      (单节点 HTTP 成功 != 节点可用; 以 Worker 返回 JSON 的 success 字段为准)
   5. 保留 success=true 的节点, 按国家分组, 生成 public/data.json + public/index.html
-  6. 网页端 (GitHub Pages) 读取 data.json 展示
+  6. 生成多种订阅与链式代理配置 (chains.txt, hosts.txt, nodes.txt, sub.txt)
+  7. 网页端 (GitHub Pages) 读取 data.json 展示
 
 退出码:
   0 = 正常完成 (允许部分节点检测失败)
   1 = 硬性失败 (数据源全挂 / 解析不出 SSTP 节点 / Worker 完全不可达 / 程序异常)
-     这些情况绝不允许"假成功"
 """
 
 import base64
@@ -196,11 +196,13 @@ def parse_csv(text):
             if "base64" in h.lower():
                 idx["openvpn_configdata_base64"] = i
                 break
-    pos = {"hostname": idx.get("hostname", 0),
-           "ip": idx.get("ip", 1),
-           "countrylong": idx.get("countrylong", 5),
-           "countryshort": idx.get("countryshort", 6),
-           "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)}
+    pos = {
+        "hostname": idx.get("hostname", 0),
+        "ip": idx.get("ip", 1),
+        "countrylong": idx.get("countrylong", 5),
+        "countryshort": idx.get("countryshort", 6),
+        "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1),
+    }
 
     rows = []
     for ln in data_lines:
@@ -222,7 +224,7 @@ def parse_csv(text):
 
 
 def parse_mirror_json(data):
-    """解析 GitHub 镜像 JSON: [ { "servers": [ {hostname, ip, countrylong, countryshort, openvpn_configdata_base64} ] } ]"""
+    """解析 GitHub 镜像 JSON"""
     servers = []
     items = data if isinstance(data, list) else [data]
     for item in items:
@@ -254,8 +256,7 @@ _REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
 
 
 def to_sstp_nodes(rows):
-    """把原始行转成 SSTP 节点: 解码 OpenVPN 配置, 仅保留 proto tcp + remote 端口。
-    host 统一为 <short>.opengw.net 形式; 返回去重前的节点列表。"""
+    """把原始行转成 SSTP 节点: 解码 OpenVPN 配置, 仅保留 proto tcp + remote 端口。"""
     nodes = []
     for r in rows:
         cfg = ""
@@ -302,34 +303,29 @@ def dedupe(nodes):
 # 第 3 步: 并发调用 Cloudflare Worker
 # ---------------------------------------------------------------------------
 def classify_network(host, exit_org, is_datacenter=None):
-    """住宅/机房分类, 按可信度排序:
-    1) Worker 返回的真实 is_datacenter 标志 (IP 情报库);
-    2) 出口 ASN 组织名关键词;
-    3) host 前缀启发式 (最后兜底, 属估算)。"""
-    # 1) 真实数据中心标志 (SSTP 版 Worker 顶层 exit 直接给出)
+    """住宅/机房分类"""
     if is_datacenter is True:
         return "datacenter"
     if is_datacenter is False:
         return "residential"
-    # 2) 出口组织名关键词
+
     org = (exit_org or "").upper()
     if org:
         if any(k in org for k in DATA_CENTER_ORG_KEYWORDS):
             return "datacenter"
         if any(k in org for k in RESIDENTIAL_ORG_KEYWORDS):
             return "residential"
-    # 3) host 前缀启发式 (估算)
+
     h = host.lower()
     if h.startswith("public-vpn"):
-        return "datacenter"      # VPN Gate 官方公共中继 (机房/托管)
+        return "datacenter"
     if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h):
-        return "residential"     # 数字编号 = 注册的家用宽带中继 (家宽, 估算)
+        return "residential"
     return "unknown"
 
 
 def check_one(node, session):
-    """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
-    单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
+    """调用 Worker 检测单节点。"""
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
     out["protocol"] = "sstp"
@@ -351,7 +347,7 @@ def check_one(node, session):
         out["latency_ms"] = j.get("responseTime")
         out["colo"] = j.get("colo")
         out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
+
         exit_info = j.get("exit") or {}
         if exit_info:
             asn = exit_info.get("asn") or {}
@@ -378,7 +374,7 @@ def check_one(node, session):
 
 
 def check_all(nodes, session):
-    """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
+    """并发检测所有节点。"""
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         futures = [pool.submit(check_one, n, session) for n in nodes]
@@ -388,7 +384,7 @@ def check_all(nodes, session):
 
 
 # ---------------------------------------------------------------------------
-# 第 4 步: 生成网页数据
+# 第 4 步: 生成网页数据与导出文件
 # ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
     available = [r for r in results if r.get("success")]
@@ -431,8 +427,7 @@ CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains
 
 
 def build_chains_text(data):
-    """生成 edgetunnel 链式代理清单: 按国家分组, 每国编号固定, 住宅优先, 延迟升序。
-    每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令每 30 分钟自动换。"""
+    """生成 edgetunnel 链式代理清单"""
     countries = data["countries"]
     lines = [
         "# VPN Gate SSTP 节点 -> edgetunnel 链式代理清单",
@@ -474,8 +469,6 @@ def build_chains_text(data):
     return "\n".join(lines) + "\n"
 
 
-# edgetunnel 入口地址池: 客户端直连 Cloudflare 的优选 IP:端口 (循环分配给每个国家节点当入口)
-# 可通过环境变量 EDGE_HOSTS 覆盖 (逗号分隔)
 EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
@@ -491,10 +484,8 @@ NODES_URL = os.environ.get("NODES_URL", "https://jerylihub.github.io/gate/nodes.
 
 
 def build_hosts_text(data):
-    """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
-    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
+    """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。"""
     countries = data["countries"]
-    # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     fallback_domain = f"{EDT_DOMAIN}:443" if EDT_DOMAIN else "example.com:443"
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [fallback_domain]
@@ -550,7 +541,7 @@ SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
 
 
 def _b64_secret_encode(plaintext, secret):
-    """复刻 edgetunnel 的 base64SecretEncode: UTF-8 循环密钥 XOR + 标准 base64。"""
+    """复刻 edgetunnel 的 base64SecretEncode"""
     data = plaintext.encode("utf-8")
     if not secret:
         return base64.b64encode(data).decode("ascii")
@@ -562,7 +553,7 @@ def _b64_secret_encode(plaintext, secret):
 
 
 def _socks5_account(address, default_port=80):
-    """复刻 edgetunnel 的 获取SOCKS5账号: user:pass@host:port -> {username,password,hostname,port}。"""
+    """复刻 edgetunnel 的 获取SOCKS5账号"""
     address = re.sub(r"^(socks5|http|https|turn|sstp)://", "", address.strip(), flags=re.I).split("#")[0].strip()
     at = address.rfind("@")
     auth, hostpart = (address[:at], address[at + 1:]) if at != -1 else ("", address)
@@ -586,8 +577,7 @@ def _socks5_account(address, default_port=80):
 
 
 def build_sub_text(data):
-    """生成 edgetunnel 完整 vless:// 订阅 (链式代理编码在 path)。
-    填进 edgetunnel 后台「订阅链接」URL, 客户端定时拉取即可自动轮换。"""
+    """生成 edgetunnel 完整 vless:// 订阅 (链式代理编码在 path)"""
     countries = data["countries"]
     lines = [
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
@@ -620,13 +610,149 @@ def build_sub_text(data):
             chain_json = json.dumps(chain, separators=(",", ":"))
             enc = _b64_secret_encode(chain_json, EDT_UUID)
             path = quote("/video/" + enc, safe="")
+            # [修饰修复] 修复 alpn 后的 # 分隔符，使其符合标准 vless URL 格式
             link = (
                 f"vless://{EDT_UUID}@{EDT_DOMAIN}:443?security=tls&type=ws"
                 f"&host={EDT_DOMAIN}&fp={EDT_FINGERPRINT}&sni={EDT_DOMAIN}"
-                f"&path={path}&encryption=none&alpn=#{quote(name, safe='')}"
+                f"&path={path}&encryption=none#{quote(name, safe='')}"
             )
             lines.append(link)
     return "\n".join(lines) + "\n"
+
+
+def get_default_html_template():
+    """定义现代化响应式 HTML 备用模板（在 web/index.html 不存在时自动启用）"""
+    return """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VPN Gate SSTP 节点状态 Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background-color: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; }
+    .stat-card { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border: 1px solid #334155; }
+    .badge-res { background-color: #10b981; color: #fff; }
+    .badge-dc { background-color: #6366f1; color: #fff; }
+    .table-custom { color: #cbd5e1; }
+    .table-custom th { color: #94a3b8; font-weight: 600; border-bottom-color: #334155; }
+    .table-custom td { border-bottom-color: #1e293b; vertical-align: middle; }
+    .btn-copy { background-color: #3b82f6; color: #fff; border: none; }
+    .btn-copy:hover { background-color: #2563eb; color: #fff; }
+  </style>
+</head>
+<body class="py-4">
+  <div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <div>
+        <h2 class="fw-bold mb-1">VPN Gate SSTP 节点看板</h2>
+        <p class="text-secondary mb-0" id="gen-time">正在加载检测数据...</p>
+      </div>
+      <span class="badge bg-success px-3 py-2 fs-6" id="source-tag">状态: 节点加载中</span>
+    </div>
+
+    <!-- 统计指标 -->
+    <div class="row g-3 mb-4" id="stats-row">
+      <div class="col-md-3"><div class="card p-3 stat-card"><div class="text-secondary small">原始节点总量</div><div class="fs-3 fw-bold text-light" id="stat-raw">-</div></div></div>
+      <div class="col-md-3"><div class="card p-3 stat-card"><div class="text-secondary small">SSTP(TCP)解析数</div><div class="fs-3 fw-bold text-info" id="stat-sstp">-</div></div></div>
+      <div class="col-md-3"><div class="card p-3 stat-card"><div class="text-secondary small">检测可用节点</div><div class="fs-3 fw-bold text-success" id="stat-success">-</div></div></div>
+      <div class="col-md-3"><div class="card p-3 stat-card"><div class="text-secondary small">覆盖国家/地区</div><div class="fs-3 fw-bold text-warning" id="stat-countries">-</div></div></div>
+    </div>
+
+    <!-- 快捷下载链接 -->
+    <div class="card p-3 mb-4">
+      <h5 class="card-title fs-6 text-secondary mb-3">订阅与配置文件速取</h5>
+      <div class="d-flex flex-wrap gap-2">
+        <a href="nodes.txt" class="btn btn-sm btn-outline-light" target="_blank">优选 IP 节点 (nodes.txt)</a>
+        <a href="hosts.txt" class="btn btn-sm btn-outline-light" target="_blank">带备注优选 (hosts.txt)</a>
+        <a href="chains.txt" class="btn btn-sm btn-outline-light" target="_blank">链式代理 (chains.txt)</a>
+        <a href="sub.txt" class="btn btn-sm btn-outline-light" target="_blank">edgetunnel 订阅 (sub.txt)</a>
+        <a href="data.json" class="btn btn-sm btn-outline-primary" target="_blank">原始 JSON 数据</a>
+      </div>
+    </div>
+
+    <!-- 节点列表 -->
+    <div class="card p-3">
+      <h5 class="card-title fs-6 text-secondary mb-3">按国家分组节点明细</h5>
+      <div id="countries-list">
+        <div class="text-center py-5 text-secondary">数据加载中，请稍候...</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    fetch('data.json')
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('gen-time').textContent = '自动更新时间: ' + data.generated_at;
+        document.getElementById('source-tag').textContent = '数据源: ' + data.source;
+        
+        const s = data.stats || {};
+        document.getElementById('stat-raw').textContent = s.raw_nodes || 0;
+        document.getElementById('stat-sstp').textContent = s.sstp_nodes || 0;
+        document.getElementById('stat-success').textContent = s.success || 0;
+        document.getElementById('stat-countries').textContent = s.countries || 0;
+
+        const container = document.getElementById('countries-list');
+        container.innerHTML = '';
+
+        if(!data.countries || Object.keys(data.countries).length === 0) {
+          container.innerHTML = '<div class="alert alert-warning">暂无有效可用节点</div>';
+          return;
+        }
+
+        for (const [cname, grp] of Object.entries(data.countries)) {
+          const section = document.createElement('div');
+          section.className = 'mb-4';
+          section.innerHTML = `
+            <div class="d-flex align-items-center gap-2 mb-2">
+              <h6 class="mb-0 fw-bold text-info">\${cname} (\${grp.code})</h6>
+              <span class="badge bg-secondary">\${grp.count} 个节点</span>
+              <span class="badge badge-res">住宅 \${grp.residential}</span>
+              <span class="badge badge-dc">机房 \${grp.datacenter}</span>
+            </div>
+            <div class="table-responsive">
+              <table class="table table-custom align-middle">
+                <thead>
+                  <tr>
+                    <th>主机地址 (Host)</th>
+                    <th>端口</th>
+                    <th>网络类型</th>
+                    <th>延迟</th>
+                    <th>节点链接</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  \${grp.nodes.map(n => `
+                    <tr>
+                      <td class="font-monospace">\${n.host}</td>
+                      <td><span class="badge bg-dark">\${n.port}</span></td>
+                      <td>
+                        <span class="badge \${n.residential === 'residential' ? 'badge-res' : 'badge-dc'}">
+                          \${n.residential === 'residential' ? '住宅 IP' : '机房 IP'}
+                        </span>
+                      </td>
+                      <td>\${n.latency_ms ? n.latency_ms + ' ms' : '-'}</td>
+                      <td>
+                        <button class="btn btn-sm btn-copy py-0 px-2" onclick="navigator.clipboard.writeText('\${n.link}')">复制</button>
+                      </td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          `;
+          container.appendChild(section);
+        }
+      })
+      .catch(e => {
+        document.getElementById('countries-list').innerHTML = `<div class="alert alert-danger">数据解析失败: \${e}</div>`;
+      });
+  </script>
+</body>
+</html>
+"""
 
 
 def write_outputs(data):
@@ -635,43 +761,43 @@ def write_outputs(data):
     with open(data_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
 
-    # 固定网页: 始终用 web/index.html 模板生成同一个 index.html (数据来自 data.json)
+    # 固定网页: 优先使用 web/index.html 模板，不存在时使用嵌入的现代化 Dashboard 模板
     html_path = os.path.join(PUBLIC_DIR, "index.html")
     if os.path.exists(TEMPLATE_HTML):
         with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
             html = f.read()
     else:
-        html = ("<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
-                "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre></body>"
-                "<script>fetch('data.json').then(r=>r.json()).then(d=>out.textContent=JSON.stringify(d.stats)).catch(e=>out.textContent='加载失败:'+e)</script></html>")
+        html = get_default_html_template()
+
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    # edgetunnel 链式代理清单 (固定 URL, 方案一: 名字不变、指令自动换)
+    # edgetunnel 链式代理清单
     chains_path = os.path.join(PUBLIC_DIR, "chains.txt")
     with open(chains_path, "w", encoding="utf-8") as f:
         f.write(build_chains_text(data))
 
-    # 可直接粘贴进后台「自定义优选IP」框的清单 (入口地址#名字$sstp://...)
+    # 优选 IP 列表
     hosts_path = os.path.join(PUBLIC_DIR, "hosts.txt")
     with open(hosts_path, "w", encoding="utf-8") as f:
         f.write(build_hosts_text(data))
 
-    # 纯节点版(无注释): 把 URL 填进 edgetunnel「自定义优选IP」框, 客户端刷新订阅即自动轮换
+    # 纯节点版 (无注释)
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     nodes_lines = [ln for ln in build_hosts_text(data).split("\n") if ln and not ln.startswith("#")]
     with open(nodes_path, "w", encoding="utf-8") as f:
         f.write("\n".join(nodes_lines) + ("\n" if nodes_lines else ""))
 
-    # 完整 vless:// 订阅 (填进后台「订阅链接」URL, 客户端自动轮换)
+    # 完整 vless:// 订阅
     sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write(build_sub_text(data))
+        
     return data_path, html_path, chains_path, hosts_path, nodes_path, sub_path
 
 
 # ---------------------------------------------------------------------------
-# main
+# main 入口
 # ---------------------------------------------------------------------------
 def main():
     session = requests.Session()
@@ -710,11 +836,11 @@ def main():
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
-    # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
+    # 硬性失败: Worker 完全不可达
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
-    # 4) 结果 + 网页
+    # 4) 结果 + 网页输出
     data = build_outputs(results, raw_count, sstp_count, source)
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
