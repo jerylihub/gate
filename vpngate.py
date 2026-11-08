@@ -473,9 +473,10 @@ EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "EDGE_HOSTS",
-        "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
-        "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
+        "bbs.alipansou.com:8443,img.856518.xyz:8443,auto.dolby.dpdns.org:8443,m.iyf.tv:8443,openai.com:8443,cf2.996616.xyz:8443,"
+        "ali.nonull.pp.ua:8443,ahrefs.com:8443,hzytjy.cn:8443,vps.cheng2001.top:8443,cf.468123.xyz:8443,fn.130519.xyz:8443,"
+        "www.giannidelprete.it:8443,cdn.7zz.cn:8443,jellyfin.roddy.eu.cc:8443,saas.sin.fan:8443,www.wto.org:8443,cf.vvhan.com:8443,"
+        "www.dbs.com.sg:8443,ikankeji.com:8443,tt.78607323.xyz:8443,lt.1930812.xyz:8443",
     ).split(",")
     if h.strip()
 ]
@@ -498,7 +499,7 @@ def build_hosts_text(data):
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
-        "# 入口用 7 个实测可用优选域名循环分配",
+        "# 入口用 22 个实测可用优选域名循环分配",
         "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
         "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
